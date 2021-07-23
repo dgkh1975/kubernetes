@@ -36,6 +36,9 @@ const (
 	DefaultIPTablesMasqueradeBit = 14
 	DefaultIPTablesDropBit       = 15
 	DefaultVolumePluginDir       = "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/"
+
+	// See https://github.com/kubernetes/enhancements/tree/master/keps/sig-node/2570-memory-qos
+	DefaultMemoryThrottlingFactor = 0.8
 )
 
 var (
@@ -245,5 +248,17 @@ func SetDefaults_KubeletConfiguration(obj *kubeletconfigv1beta1.KubeletConfigura
 	componentbaseconfigv1alpha1.RecommendedLoggingConfiguration(&obj.Logging)
 	if obj.EnableSystemLogHandler == nil {
 		obj.EnableSystemLogHandler = utilpointer.BoolPtr(true)
+	}
+	if obj.EnableProfilingHandler == nil {
+		obj.EnableProfilingHandler = utilpointer.BoolPtr(true)
+	}
+	if obj.EnableDebugFlagsHandler == nil {
+		obj.EnableDebugFlagsHandler = utilpointer.BoolPtr(true)
+	}
+	if obj.SeccompDefault == nil {
+		obj.SeccompDefault = utilpointer.BoolPtr(false)
+	}
+	if obj.MemoryThrottlingFactor == nil {
+		obj.MemoryThrottlingFactor = utilpointer.Float64Ptr(DefaultMemoryThrottlingFactor)
 	}
 }

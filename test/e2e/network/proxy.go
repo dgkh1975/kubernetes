@@ -40,6 +40,7 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
 	e2erc "k8s.io/kubernetes/test/e2e/framework/rc"
+	"k8s.io/kubernetes/test/e2e/network/common"
 	testutils "k8s.io/kubernetes/test/utils"
 	imageutils "k8s.io/kubernetes/test/utils/image"
 
@@ -68,7 +69,7 @@ type jsonResponse struct {
 	Body   string
 }
 
-var _ = SIGDescribe("Proxy", func() {
+var _ = common.SIGDescribe("Proxy", func() {
 	version := "v1"
 	ginkgo.Context("version "+version, func() {
 		options := framework.Options{
@@ -273,7 +274,15 @@ var _ = SIGDescribe("Proxy", func() {
 			}
 		})
 
-		ginkgo.It("A set of valid responses are returned for both pod and service ProxyWithPath", func() {
+		/*
+			Release: v1.21
+			Testname: Proxy, validate ProxyWithPath responses
+			Description: Attempt to create a pod and a service. A
+			set of pod and service endpoints MUST be accessed via
+			ProxyWithPath using a list of http methods. A valid
+			response MUST be returned for each endpoint.
+		*/
+		framework.ConformanceIt("A set of valid responses are returned for both pod and service ProxyWithPath", func() {
 
 			ns := f.Namespace.Name
 			msg := "foo"
