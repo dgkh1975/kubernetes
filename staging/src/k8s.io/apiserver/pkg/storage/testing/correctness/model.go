@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
 )
 
@@ -105,31 +106,71 @@ func (s *Model) Equal(other *Model) bool {
 // Step applies an operation to the sequential state machine. change is the
 // write the operation made, or nil if the operation didn't write.
 func (s *Model) Step(input Request, output Response) (ok bool, next *Model, change *Change) {
-	next = s
-	var expected Response
-	switch input.Op {
-	case OpCreate:
-		next = s.Clone()
-		expected, change = next.create(input.Key, input.Create.Object)
-	case OpDelete:
-		next = s.Clone()
-		expected, change = next.delete(context.Background(), input.Key, input.Delete.Preconditions, nil)
-	case OpGet:
-		expected = s.get(input.Key, input.Get.Options)
-	case OpList:
-		// Model only validates consistent reads, for stale reads we just validate RV and contents are validated later during replay.
-		if input.List.Options.ResourceVersion != "" {
-			return s.validateListRV(input.List.Options, output), s, nil
+	if input.Op == OpList && input.List.Options.ResourceVersion != "" {
+		if err := s.checkList(input.Key, input.List.Options); err != nil {
+			return reflect.DeepEqual(Response{Err: err}, output), s, nil
 		}
-		expected = s.list(input.Key, input.List.Options)
-	case OpUpdate:
-		next = s.Clone()
-		expected, change = next.update(context.Background(), input.Key, input.Update.IgnoreNotFound, input.Update.Preconditions, input.Update.UpdateFunc, input.Update.CachedExistingObject)
+		// Model only validates consistent reads, for stale reads we just validate RV and contents are validated later during replay.
+		return s.validateListRV(input.List.Options, output), s, nil
 	}
+	expected, next, change := s.execute(input)
 	if !reflect.DeepEqual(expected, output) {
 		return false, s, nil
 	}
 	return true, next, change
+}
+
+// execute returns the response storage gives for input served from this
+// state. The receiver is never modified, writes return a new state.
+func (s *Model) execute(input Request) (Response, *Model, *Change) {
+	switch input.Op {
+	case OpCreate:
+		next := s.Clone()
+		resp, change := next.create(input.Key, input.Create.Object)
+		return resp, next, change
+	case OpDelete:
+		next := s.Clone()
+		resp, change := next.delete(context.Background(), input.Key, input.Delete.Preconditions, nil)
+		return resp, next, change
+	case OpGet:
+		return s.get(input.Key, input.Get.Options), s, nil
+	case OpList:
+		return s.list(input.Key, input.List.Options), s, nil
+	case OpUpdate:
+		next := s.Clone()
+		resp, change := next.update(context.Background(), input.Key, input.Update.IgnoreNotFound, input.Update.Preconditions, input.Update.UpdateFunc, input.Update.CachedExistingObject)
+		return resp, next, change
+	default:
+		panic(fmt.Sprintf("unknown operation %q", input.Op))
+	}
+}
+
+// checkList returns the error storage returns for an invalid list and panics
+// on lists the model doesn't support.
+func (s *Model) checkList(key string, opts storage.ListOptions) error {
+	if err := checkKey(key, opts.Recursive); err != nil {
+		return err
+	}
+	if _, _, err := storage.ValidateListOptions("", s.Versioner, opts); err != nil {
+		return err
+	}
+	if opts.Predicate.Label == nil || opts.Predicate.Field == nil {
+		// etcd3 and the cacher call methods on both selectors.
+		panic("nil label or field selector is not supported, use storage.Everything to match everything")
+	}
+	if opts.Predicate.Limit != 0 || opts.Predicate.Continue != "" {
+		panic("pagination (limit, continue) is not supported")
+	}
+	if !opts.Predicate.Empty() && opts.Predicate.GetAttrs == nil {
+		panic("selectors without GetAttrs are not supported")
+	}
+	if opts.RecordTimestamps {
+		panic("recordTimestamps is not supported, it wraps objects in storage-internal types")
+	}
+	if !opts.Predicate.Empty() {
+		panic("label and field selectors are not supported, the model doesn't filter lists")
+	}
+	return nil
 }
 
 func (s *Model) validateListRV(opts storage.ListOptions, output Response) bool {
@@ -179,6 +220,12 @@ func (s *Model) validateListRV(opts storage.ListOptions, output Response) bool {
 }
 
 func (s *Model) update(ctx context.Context, key string, ignoreNotFound bool, preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) (Response, *Change) {
+	if err := checkKey(key, false); err != nil {
+		return Response{Err: err}, nil
+	}
+	if tryUpdate == nil {
+		panic("tryUpdate must be set")
+	}
 	stored, exists := s.Items[key]
 	var currentObj runtime.Object
 	var currentRV uint64
@@ -202,10 +249,6 @@ func (s *Model) update(ctx context.Context, key string, ignoreNotFound bool, pre
 
 	if err := preconditions.Check(s.Prefix+key, currentObj); err != nil {
 		return Response{Object: nil, Err: err}, nil
-	}
-
-	if tryUpdate == nil {
-		return Response{Object: nil, Err: fmt.Errorf("tryUpdate function must not be nil")}, nil
 	}
 
 	updated, _, err := tryUpdate(currentObj, storage.ResponseMeta{ResourceVersion: currentRV})
@@ -237,11 +280,16 @@ func (s *Model) update(ctx context.Context, key string, ignoreNotFound bool, pre
 	}
 	accessor.SetResourceVersion(strconv.FormatUint(s.ResourceVersion, 10))
 	s.Items[key] = copied
-	// With ignoreNotFound on a missing key, stored is nil and this is a create.
-	return Response{Object: copied, Err: nil}, &Change{ResourceVersion: s.ResourceVersion, Object: copied, PrevObject: stored}
+	return Response{Object: copied, Err: nil}, &Change{Key: key, ResourceVersion: s.ResourceVersion, Object: copied, PrevObject: stored}
 }
 
 func (s *Model) create(key string, obj runtime.Object) (Response, *Change) {
+	if err := checkKey(key, false); err != nil {
+		return Response{Err: err}, nil
+	}
+	if rv, err := s.Versioner.ObjectResourceVersion(obj); err == nil && rv != 0 {
+		return Response{Err: storage.ErrResourceVersionSetOnCreate}, nil
+	}
 	if _, exists := s.Items[key]; exists {
 		return Response{Object: nil, Err: storage.NewKeyExistsError(s.Prefix+key, 0)}, nil
 	}
@@ -253,10 +301,16 @@ func (s *Model) create(key string, obj runtime.Object) (Response, *Change) {
 	}
 	accessor.SetResourceVersion(strconv.FormatUint(s.ResourceVersion, 10))
 	s.Items[key] = copied
-	return Response{Object: copied, Err: nil}, &Change{ResourceVersion: s.ResourceVersion, Object: copied}
+	return Response{Object: copied, Err: nil}, &Change{Key: key, ResourceVersion: s.ResourceVersion, Object: copied}
 }
 
 func (s *Model) get(key string, opts storage.GetOptions) Response {
+	if err := checkKey(key, false); err != nil {
+		return Response{Err: err}
+	}
+	if opts.ResourceVersion != "" {
+		panic("get with resourceVersion is not supported, the model only serves the latest state")
+	}
 	stored, exists := s.Items[key]
 	if !exists {
 		if opts.IgnoreNotFound {
@@ -268,10 +322,12 @@ func (s *Model) get(key string, opts storage.GetOptions) Response {
 }
 
 func (s *Model) list(key string, opts storage.ListOptions) Response {
-	prefix := strings.TrimSuffix(key, "/") + "/"
+	if err := s.checkList(key, opts); err != nil {
+		return Response{Err: err}
+	}
 	var items []runtime.Object
 	for _, k := range slices.Sorted(maps.Keys(s.Items)) {
-		if (opts.Recursive && strings.HasPrefix(k, prefix)) || (!opts.Recursive && k == key) {
+		if keyInScope(key, opts.Recursive, k) {
 			items = append(items, s.Items[k].DeepCopyObject())
 		}
 	}
@@ -285,7 +341,45 @@ func (s *Model) list(key string, opts storage.ListOptions) Response {
 	return Response{Object: list, Err: nil}
 }
 
+// keyInScope reports whether k is selected by a list or watch on key.
+func keyInScope(key string, recursive bool, k string) bool {
+	if !recursive {
+		return k == key
+	}
+	// Like storage.PrepareKey, "/a" must not select "/ab".
+	return strings.HasPrefix(k, strings.TrimSuffix(key, "/")+"/")
+}
+
+func checkKey(key string, recursive bool) error {
+	_, err := storage.PrepareKey("", key, recursive)
+	return err
+}
+
+func (s *Model) initialEvents(request WatchRequest) ([]watch.Event, error) {
+	var events []watch.Event
+	for _, k := range slices.Sorted(maps.Keys(s.Items)) {
+		if !keyInScope(request.Key, request.Options.Recursive, k) {
+			continue
+		}
+		obj := s.Items[k]
+		matches, err := request.Options.Predicate.Matches(obj)
+		if err != nil {
+			return nil, err
+		}
+		if matches {
+			events = append(events, watch.Event{
+				Type:   watch.Added,
+				Object: obj.DeepCopyObject(),
+			})
+		}
+	}
+	return events, nil
+}
+
 func (s *Model) delete(ctx context.Context, key string, preconditions *storage.Preconditions, validateDeletion storage.ValidateObjectFunc) (Response, *Change) {
+	if err := checkKey(key, false); err != nil {
+		return Response{Err: err}, nil
+	}
 	stored, exists := s.Items[key]
 	if !exists {
 		return Response{Object: nil, Err: storage.NewKeyNotFoundError(s.Prefix+key, int64(s.ResourceVersion))}, nil
@@ -306,7 +400,7 @@ func (s *Model) delete(ctx context.Context, key string, preconditions *storage.P
 	}
 	accessor.SetResourceVersion(strconv.FormatUint(s.ResourceVersion, 10))
 	delete(s.Items, key)
-	return Response{Object: deletedObj, Err: nil}, &Change{ResourceVersion: s.ResourceVersion, PrevObject: stored}
+	return Response{Object: deletedObj, Err: nil}, &Change{Key: key, ResourceVersion: s.ResourceVersion, PrevObject: stored}
 }
 
 func (s *Model) Describe() string {
